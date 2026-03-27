@@ -1128,6 +1128,15 @@ Examples after loading chain_objects:
           <li><b>Memory management</b> &mdash; When server memory reaches 85%, the oldest loaded table is automatically evicted to free space.</li>
         </ul>
 
+        <h3 style="color:#f0c040">Deployment Note</h3>
+        <p>The source code in the <b>GitHub repository</b> does not contain any secrets. All credentials (Polaris OAuth client IDs/secrets, login password, AWS keys) are loaded from <b>environment variables</b> at runtime.</p>
+        <ul>
+          <li>On the server, credentials are stored in <code style="background:#1a1f35;padding:2px 6px;border-radius:3px">/usr/sap/gcs_explorer.env</code> and loaded by systemd via <code style="background:#1a1f35;padding:2px 6px;border-radius:3px">EnvironmentFile</code>.</li>
+          <li>When deploying from the repo to a <b>new server</b>, copy <code style="background:#1a1f35;padding:2px 6px;border-radius:3px">server/gcs_explorer.env.example</code> to <code style="background:#1a1f35;padding:2px 6px;border-radius:3px">/usr/sap/gcs_explorer.env</code> and fill in real values.</li>
+          <li>The <b>current production server</b> (sapidesecc8) has credentials hardcoded in its deployed copy and continues to work without the env file.</li>
+          <li>You can also update credentials at runtime using the <b>Manage Credentials</b> panel in the Polaris Catalog tab (changes persist in memory until restart).</li>
+        </ul>
+
         <h3 style="color:#f0c040">Troubleshooting</h3>
         <ul>
           <li><b>Cannot load Polaris tables</b> &mdash; Make sure you clicked one of the cloud provider buttons (Google Cloud / Azure / AWS) to connect the catalog first.</li>

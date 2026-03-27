@@ -122,6 +122,24 @@ Click the yellow **Manage Credentials** button in the Polaris Catalog tab to vie
 | SSL | ZeroSSL certificate (expires Jun 25, 2026) |
 | Service | `gcs-explorer.service` (systemd, auto-restart, boot start) |
 
+### Important: Environment Variables
+
+The GitHub repository does **not** contain any secrets. All credentials are loaded from
+environment variables at runtime. When deploying from this repo, you must create
+`/usr/sap/gcs_explorer.env` on the server with the real values. Use
+`server/gcs_explorer.env.example` as a template:
+
+```bash
+scp server/gcs_explorer.env.example sapidesecc8:/usr/sap/gcs_explorer.env
+# Then edit /usr/sap/gcs_explorer.env on the server with real credentials
+```
+
+The systemd service loads this file automatically via `EnvironmentFile`.
+
+The **current production server** (sapidesecc8) already has credentials hardcoded in its
+deployed copy of `gcs_explorer_server.py` and will continue to work. This note only
+applies to fresh deployments from the repository.
+
 ### Deploy Updates
 
 ```bash
