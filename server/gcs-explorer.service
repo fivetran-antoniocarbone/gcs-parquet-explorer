@@ -1,0 +1,16 @@
+[Unit]
+Description=GCS Parquet Explorer Web Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/sap
+EnvironmentFile=-/usr/sap/gcs_explorer.env
+ExecStart=/root/miniconda/bin/python3 /usr/sap/gcs_explorer_server.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/gcs_explorer.log
+StandardError=append:/var/log/gcs_explorer.log
+
+[Install]
+WantedBy=multi-user.target
