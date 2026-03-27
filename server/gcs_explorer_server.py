@@ -884,32 +884,6 @@ def read_file_text(blob_path):
         return {"status": "error", "message": str(e)}
 
 
-def read_delta_log(table_prefix):
-    """Read Delta Lake transaction log for a table."""
-    try:
-        bucket = gcs_client.bucket(current_bucket)
-        log_prefix = table_prefix + "_delta_log/"
-        blobs = list(gcs_client.list_blobs(bucket, prefix=log_prefix))
-        json_blobs = sorted([b for b in blobs if b.name.endswith(".json")], key=lambda b: b.name)
-
-        if not json_blobs:
-            return {"status": "error", "message": "No _delta_log found"}
-
-        entries = []
-        for blob in json_blobs[-5:]:
-            content = blob.download_as_text()
-            name = blob.name.split("/")[-1]
-            parsed = []
-            for line in content.strip().split("\n"):
-                try:
-                    parsed.append(json.loads(line))
-                except Exception:
-                    parsed.append({"raw": line[:300]})
-            entries.append({"file": name, "entries": parsed})
-
-        return {"status": "ok", "log_entries": entries}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
 
 
 def get_loaded_tables():
@@ -1015,11 +989,6 @@ table th.sort-desc::after { content: ' ▼'; color: #58a6ff; font-size: 11px; }
 table td { padding: 7px 10px; border-bottom: 1px solid #1e2233; color: #c9d1d9; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 16px; }
 table tr:hover td { background: #1c2030; }
 .info-bar { padding: 8px 12px; background: #13161f; border-top: 1px solid #2d3348; font-size: 16px; color: #8b949e; display: flex; justify-content: space-between; }
-.schema-view { padding: 16px; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 17px; white-space: pre-wrap; color: #8b949e; overflow: auto; flex: 1; }
-.delta-view { padding: 14px; overflow: auto; flex: 1; }
-.delta-entry { margin-bottom: 12px; border: 1px solid #2d3348; border-radius: 5px; overflow: hidden; }
-.delta-entry-header { background: #1a1f35; padding: 8px 12px; font-weight: 600; color: #58a6ff; font-size: 17px; }
-.delta-entry-body { padding: 10px 12px; white-space: pre-wrap; color: #8b949e; max-height: 300px; overflow: auto; font-family: monospace; font-size: 16px; }
 .loading { text-align: center; padding: 30px; color: #6e7681; }
 .empty { text-align: center; padding: 40px 16px; color: #6e7681; font-size: 18px; }
 .cell-popup { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); background: #1c2030; border: 1px solid #58a6ff; border-radius: 8px; padding: 20px; max-width: 80vw; max-height: 80vh; overflow: auto; z-index: 100; white-space: pre-wrap; font-family: monospace; font-size: 17px; color: #e1e4e8; }
@@ -1058,18 +1027,13 @@ table tr:hover td { background: #1c2030; }
   <div class="main">
     <div class="tab-bar">
       <div class="tab active" data-tab="data" onclick="switchTab('data')">Data</div>
-      <div class="tab" data-tab="schema" onclick="switchTab('schema')">Schema</div>
       <div class="tab" data-tab="sql" onclick="switchTab('sql')">SQL Query</div>
-      <div class="tab" data-tab="delta" onclick="switchTab('delta')">Delta Log</div>
       <div class="tab" data-tab="polaris" onclick="switchTab('polaris')">Polaris Catalog</div>
       <div class="tab" data-tab="docs" onclick="switchTab('docs')">Documentation</div>
     </div>
     <div class="panel active" id="panel-data">
       <div class="table-wrap" id="dataTable"><div class="empty">Select a parquet file or folder to view data</div></div>
       <div class="info-bar" id="dataInfo"></div>
-    </div>
-    <div class="panel" id="panel-schema">
-      <div class="schema-view" id="schemaView">Select a parquet file to view its Arrow schema</div>
     </div>
     <div class="panel" id="panel-sql">
       <div class="sql-area">
@@ -1092,9 +1056,6 @@ Examples after loading chain_objects:
       <div class="loaded-tables" id="loadedTables"></div>
       <div class="table-wrap" id="sqlResults"><div class="empty">Run a SQL query to see results</div></div>
       <div class="info-bar" id="sqlInfo"></div>
-    </div>
-    <div class="panel" id="panel-delta">
-      <div class="delta-view" id="deltaView"><div class="empty">Browse to a table directory to view its Delta transaction log</div></div>
     </div>
     <div class="panel" id="panel-polaris">
       <div style="padding:20px;overflow:auto">
@@ -1224,7 +1185,7 @@ Examples after loading chain_objects:
           <li><b>Filter</b> &mdash; Type in the filter box to narrow down directories and files by name.</li>
           <li><b>Sort</b> &mdash; Click <b>Name</b>, <b>Files</b>, or <b>Size</b> column headers to sort. Click again to reverse.</li>
           <li><b>Load a table</b> &mdash; Click a <code style="background:#1a1f35;padding:2px 6px;border-radius:3px">.parquet</code> file to load it, or click the <span style="color:#f0c040">Load all parquet data</span> button to load all files in a directory as one table.</li>
-          <li><b>View data</b> &mdash; After loading, the <b>Data</b> tab shows the table contents. Click any column header to sort. The <b>Schema</b> tab shows column names and types.</li>
+          <li><b>View data</b> &mdash; After loading, the <b>Data</b> tab shows the table contents. Click any column header to sort.</li>
         </ul>
 
         <h3 style="color:#f0c040">Polaris Iceberg Catalogs (Multi-Cloud)</h3>
@@ -1268,9 +1229,7 @@ Examples after loading chain_objects:
         <h3 style="color:#f0c040">Tabs Reference</h3>
         <ul>
           <li><b>Data</b> &mdash; View loaded table contents with sortable columns. Click any cell to see the full value.</li>
-          <li><b>Schema</b> &mdash; Column names, data types, and row count for the last loaded table.</li>
           <li><b>SQL Query</b> &mdash; DuckDB SQL editor with autocomplete and results grid.</li>
-          <li><b>Delta Log</b> &mdash; View Delta Lake transaction log entries for the current directory.</li>
           <li><b>Polaris Catalog</b> &mdash; Connect and browse Polaris Iceberg catalogs (GCS, Azure, AWS).</li>
           <li><b>Documentation</b> &mdash; This page.</li>
         </ul>
@@ -1324,7 +1283,6 @@ let polarisTables = [];  // Polaris Iceberg tables for autocomplete
 let lastBrowseItems = [];  // cached items for re-sorting
 let lastBrowsePrefix = '';
 let lastHasDataDir = false;
-let lastHasDeltaLog = false;
 let sortField = 'name';
 let sortAsc = true;
 
@@ -1405,7 +1363,6 @@ async function browse(prefix, bucket) {
   lastBrowseItems = r.items;
   lastBrowsePrefix = prefix;
   lastHasDataDir = r.items.some(i => i.name === 'data/');
-  lastHasDeltaLog = r.items.some(i => i.name === '_delta_log/');
   browsedTables = r.items.filter(i => i.is_dir && i.name !== 'data/' && i.name !== '_delta_log/').map(i => i.name.replace('/', ''));
 
   // Show sort bar only when dirs have stats
@@ -1413,7 +1370,6 @@ async function browse(prefix, bucket) {
   document.getElementById('sortBar').style.display = hasStats ? 'flex' : 'none';
 
   renderFileList();
-  if (lastHasDeltaLog) loadDeltaLog(prefix);
 }
 
 function renderFileList() {
@@ -1515,7 +1471,6 @@ async function loadParquet(path) {
   allRows = r.rows;
   renderTable('dataTable', r.columns, r.rows);
   document.getElementById('dataInfo').textContent = r.total_rows + ' rows | ' + r.columns.length + ' cols | registered as: ' + (r.registered_as || 'N/A');
-  document.getElementById('schemaView').textContent = r.schema || '';
   updateLoadedTables();
 }
 
@@ -1530,27 +1485,16 @@ async function loadDir(prefix) {
   allRows = r.rows;
   renderTable('dataTable', r.columns, r.rows);
   document.getElementById('dataInfo').textContent = r.total_rows + ' rows | ' + r.columns.length + ' cols | ' + r.files_read + ' files | registered as: ' + r.registered_as;
-  document.getElementById('schemaView').textContent = r.schema || '';
   updateLoadedTables();
 }
 
 async function loadText(path) {
-  switchTab('schema');
-  document.getElementById('schemaView').textContent = 'Loading...';
+  switchTab('data');
+  document.getElementById('dataTable').innerHTML = '<div class="loading">Loading...</div>';
   const r = await api('/api/cat', { path });
-  document.getElementById('schemaView').textContent = r.status === 'ok' ? r.content : r.message;
+  document.getElementById('dataTable').innerHTML = '<pre style="padding:16px;font-family:SF Mono,Fira Code,monospace;font-size:17px;white-space:pre-wrap;color:#8b949e;overflow:auto">' + escHtml(r.status === 'ok' ? r.content : r.message) + '</pre>';
 }
 
-async function loadDeltaLog(prefix) {
-  const r = await api('/api/delta', { prefix });
-  const el = document.getElementById('deltaView');
-  if (r.status !== 'ok') { el.innerHTML = '<div class="empty">' + r.message + '</div>'; return; }
-  let html = '';
-  for (const e of r.log_entries) {
-    html += '<div class="delta-entry"><div class="delta-entry-header">' + e.file + '</div><div class="delta-entry-body">' + escHtml(JSON.stringify(e.entries, null, 2)) + '</div></div>';
-  }
-  el.innerHTML = html || '<div class="empty">No delta log entries</div>';
-}
 
 async function runQuery() {
   const q = document.getElementById('sqlInput').value.trim();
@@ -2365,8 +2309,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif route == "/api/sql":
             self.send_json(run_sql(params.get("query", ""), params.get("prefix", "")))
 
-        elif route == "/api/delta":
-            self.send_json(read_delta_log(params.get("prefix", "")))
 
         elif route == "/api/cat":
             self.send_json(read_file_text(params.get("path", "")))
