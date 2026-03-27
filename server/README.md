@@ -45,6 +45,11 @@ SSL certificate and key paths are also at the top of the file.
 ## Server-Specific Features
 
 - **ThreadingHTTPServer** with `threading.Lock()` for DuckDB thread safety
+- **AWS S3 vended credentials** — `_rewrite_aws_query()` fetches vended S3 creds from Polaris REST API, rewrites queries to `iceberg_scan()` (DuckDB Iceberg ext doesn't support `X-Iceberg-Access-Delegation` header)
+- **45s query timeout** — `threading.Timer` + `db_conn.interrupt()` prevents unauthorized table queries from hanging
+- **Restart Server button** — `POST /api/restart` → `systemctl restart gcs-explorer` + frontend auto-reconnect
+- **SO_REUSEADDR** — `allow_reuse_address = True` prevents "Address already in use" on quick restarts
+- **Unbuffered output** — `python3 -u` in systemd ExecStart for immediate log visibility
 - **Polaris REST API** for namespace/table listing (~0.3s vs 70s)
 - **Email login** with session cookies (`HttpOnly; Secure; SameSite=Lax`)
 - **Azure curl transport** (`SET azure_transport_option_type='curl'`) for SUSE SSL compatibility

@@ -334,12 +334,150 @@ def _polaris_oauth_token(endpoint, client_id, client_secret):
         return json.loads(resp.read())["access_token"]
 
 
-def _polaris_rest_get(endpoint, path, token):
+def _polaris_rest_get(endpoint, path, token, extra_headers=None):
     """GET a Polaris REST API path with bearer token."""
     url = endpoint.rstrip("/") + path
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    headers = {"Authorization": f"Bearer {token}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
+
+
+# Cache vended S3 credentials per catalog
+_s3_vended_cache = {}  # alias -> {"token": str, "expires": float, "s3_creds": dict}
+
+
+def _get_aws_polaris_token_and_creds(alias):
+    """Get or refresh OAuth token + S3 vended credentials for an AWS Polaris catalog."""
+    import time
+    cache = _s3_vended_cache.get(alias, {})
+    if cache.get("expires", 0) > time.time() and cache.get("s3_creds"):
+        return cache["token"], cache["s3_creds"]
+
+    cat = polaris_catalogs.get(alias)
+    if not cat:
+        return None, None
+    try:
+        token = _polaris_oauth_token(cat["endpoint"], cat["client_id"], cat["client_secret"])
+        catalog_name = cat["catalog"]
+        # Get any table to fetch vended S3 credentials (they're catalog-wide)
+        ns_data = _polaris_rest_get(cat["endpoint"], f"/v1/{catalog_name}/namespaces", token)
+        namespaces = ns_data.get("namespaces", [])
+        if not namespaces:
+            return token, None
+        ns_name = namespaces[0][0] if isinstance(namespaces[0], list) else namespaces[0]
+        tbl_data = _polaris_rest_get(cat["endpoint"],
+            f"/v1/{catalog_name}/namespaces/{ns_name}/tables", token)
+        tables = tbl_data.get("identifiers", [])
+        if not tables:
+            return token, None
+        tbl_name = tables[0].get("name", tables[0]) if isinstance(tables[0], dict) else tables[0]
+        tbl_meta = _polaris_rest_get(cat["endpoint"],
+            f"/v1/{catalog_name}/namespaces/{ns_name}/tables/{tbl_name}", token,
+            extra_headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
+        s3_creds = tbl_meta.get("config", {})
+        _s3_vended_cache[alias] = {"token": token, "expires": time.time() + 3000, "s3_creds": s3_creds}
+        # Create/refresh S3 secret in DuckDB
+        ak = s3_creds.get("s3.access-key-id", "")
+        sk = s3_creds.get("s3.secret-access-key", "")
+        st = s3_creds.get("s3.session-token", "")
+        if ak and sk:
+            with db_lock:
+                db_conn.execute(f"DROP SECRET IF EXISTS s3_vended_{alias};")
+                db_conn.execute(f"""
+                    CREATE SECRET s3_vended_{alias} (
+                        TYPE S3,
+                        KEY_ID '{ak}',
+                        SECRET '{sk}',
+                        SESSION_TOKEN '{st}',
+                        REGION 'us-west-2'
+                    );
+                """)
+            print(f"  S3 vended credentials refreshed for catalog '{alias}'")
+        return token, s3_creds
+    except Exception as e:
+        print(f"  WARNING: Failed to get vended S3 credentials for {alias}: {e}")
+        return None, None
+
+
+def _rewrite_aws_query(query):
+    """Rewrite queries targeting AWS Polaris catalogs to use iceberg_scan().
+
+    DuckDB's ATTACH TYPE ICEBERG hangs on S3-backed catalogs because it doesn't
+    send the X-Iceberg-Access-Delegation header needed for vended credentials.
+    Workaround: resolve table metadata-location via REST API, then use iceberg_scan().
+    """
+    import re
+    q_lower = query.lower().strip()
+
+    # Find which AWS catalog alias is referenced
+    target_alias = None
+    for alias, cat in polaris_catalogs.items():
+        if alias in q_lower and (".aws." in cat.get("endpoint", "") or "aws" in alias):
+            target_alias = alias
+            break
+    if not target_alias:
+        return query  # not an AWS query, return unchanged
+
+    cat = polaris_catalogs[target_alias]
+    catalog_name = cat["catalog"]
+
+    # Extract table references like aws.namespace.table
+    # Pattern: alias.namespace.table (possibly quoted)
+    pattern = re.compile(
+        rf'\b{re.escape(target_alias)}\.([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b',
+        re.IGNORECASE
+    )
+    matches = pattern.findall(query)
+    if not matches:
+        return query  # no table references found
+
+    token, s3_creds = _get_aws_polaris_token_and_creds(target_alias)
+    if not token:
+        return query  # can't get token, let it fail normally
+
+    rewritten = query
+    for namespace, table in matches:
+        try:
+            tbl_meta = _polaris_rest_get(cat["endpoint"],
+                f"/v1/{catalog_name}/namespaces/{namespace}/tables/{table}", token,
+                extra_headers={"X-Iceberg-Access-Delegation": "vended-credentials"})
+            meta_loc = tbl_meta.get("metadata-location", "")
+            if not meta_loc:
+                continue
+            # Replace catalog.namespace.table with iceberg_scan('metadata-location')
+            full_ref = f"{target_alias}.{namespace}.{table}"
+            replacement = f"iceberg_scan('{meta_loc}')"
+            # Case-insensitive replace of the table reference
+            rewritten = re.sub(
+                rf'\b{re.escape(target_alias)}\.{re.escape(namespace)}\.{re.escape(table)}\b',
+                replacement, rewritten, flags=re.IGNORECASE
+            )
+            print(f"  AWS query rewrite: {full_ref} -> iceberg_scan(...)")
+
+            # Also refresh S3 creds from this specific table's config
+            cfg = tbl_meta.get("config", {})
+            ak = cfg.get("s3.access-key-id", "")
+            sk = cfg.get("s3.secret-access-key", "")
+            st = cfg.get("s3.session-token", "")
+            if ak and sk:
+                with db_lock:
+                    db_conn.execute(f"DROP SECRET IF EXISTS s3_vended_{target_alias};")
+                    db_conn.execute(f"""
+                        CREATE SECRET s3_vended_{target_alias} (
+                            TYPE S3,
+                            KEY_ID '{ak}',
+                            SECRET '{sk}',
+                            SESSION_TOKEN '{st}',
+                            REGION 'us-west-2'
+                        );
+                    """)
+        except Exception as e:
+            print(f"  WARNING: Failed to resolve {target_alias}.{namespace}.{table}: {e}")
+
+    return rewritten
 
 
 def list_polaris_namespaces(alias):
@@ -662,12 +800,31 @@ def _extract_missing_table(error_msg):
 
 def run_sql(query, browse_prefix=""):
     """Execute a SQL query via DuckDB. Auto-loads tables from GCS if not found."""
-    def _exec(q):
-        with db_lock:
-            r = db_conn.execute(q)
-            cols = [desc[0] for desc in r.description] if r.description else []
-            data = r.fetchall()
+    def _exec(q, timeout_sec=45):
+        cancelled = [False]
+        def watchdog():
+            cancelled[0] = True
+            try:
+                db_conn.interrupt()
+            except Exception:
+                pass
+        timer = threading.Timer(timeout_sec, watchdog)
+        timer.start()
+        try:
+            with db_lock:
+                r = db_conn.execute(q)
+                cols = [desc[0] for desc in r.description] if r.description else []
+                data = r.fetchall()
+        except Exception as e:
+            if cancelled[0]:
+                raise Exception("Query timed out after {}s. You may not have access to this table.".format(timeout_sec))
+            raise
+        finally:
+            timer.cancel()
         return cols, data
+
+    # Rewrite AWS Polaris queries to use iceberg_scan() with vended S3 credentials
+    query = _rewrite_aws_query(query)
 
     try:
         columns, rows = _exec(query)
@@ -873,13 +1030,13 @@ table tr:hover td { background: #1c2030; }
 <div class="header">
   <svg class="fivetran-logo" viewBox="0 0 260 50" xmlns="http://www.w3.org/2000/svg"><g transform="translate(2,0)"><polygon points="4,48 14,2 22,2 12,48" fill="#0073FF" rx="2"/><polygon points="17,48 27,2 35,2 25,48" fill="#0073FF"/><polygon points="30,48 40,2 48,2 38,48" fill="#0073FF"/></g><text x="60" y="37" font-family="Arial,Helvetica,sans-serif" font-size="34" font-weight="700" fill="#0073FF">Fivetran</text></svg>
   <svg style="height:38px;vertical-align:middle" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg"><path d="M15 30 L50 10 L85 30 L85 70 L50 90 L15 70 Z" fill="#4285F4" stroke="#3367D6" stroke-width="1.5"/><rect x="25" y="36" width="50" height="6" rx="1" fill="#AECBFA"/><rect x="25" y="46" width="50" height="6" rx="1" fill="#AECBFA"/><rect x="25" y="56" width="50" height="6" rx="1" fill="#AECBFA"/><text x="50" y="82" text-anchor="middle" font-family="Arial,sans-serif" font-size="8" fill="#4285F4" font-weight="600">GCS</text></svg>
-  <h1>GCS Parquet Explorer</h1>
-  <span class="sub">SAP CDS Views | DuckDB SQL Engine</span>
+  <h1>GCS Parquet Explorer AND Iceberg Table Explorer</h1>
   <span id="authStatus" class="status pending">Connecting...</span>
   <span class="team">
     <span id="userEmail" style="color:#58a6ff"></span><br>
     Engineered by the SAP Specialist Team
     <span style="margin-left:12px"><a href="/datalake_reader/logout" style="color:#6e7681;font-size:12px;text-decoration:none" onmouseover="this.style.color='#f06060'" onmouseout="this.style.color='#6e7681'">Logout</a></span>
+    <span style="margin-left:8px"><a href="#" onclick="restartServer();return false" style="color:#6e7681;font-size:12px;text-decoration:none" onmouseover="this.style.color='#f0c040'" onmouseout="this.style.color='#6e7681'">Restart Server</a></span>
   </span>
 </div>
 <div class="container">
@@ -1046,7 +1203,7 @@ Examples after loading chain_objects:
     </div>
     <div class="panel" id="panel-docs">
       <div style="padding:24px 32px;overflow:auto;color:#c9d1d9;font-size:16px;line-height:1.7;scrollbar-width:none;-ms-overflow-style:none">
-        <h2 style="color:#58a6ff;margin-top:0">GCS Parquet Explorer</h2>
+        <h2 style="color:#58a6ff;margin-top:0">GCS Parquet Explorer AND Iceberg Table Explorer</h2>
         <p style="color:#6e7681;font-style:italic">Engineered by the Fivetran SAP Specialist Team</p>
 
         <h3 style="color:#f0c040">What Is This?</h3>
@@ -1593,32 +1750,32 @@ async function connectCloud(provider) {
   }
 
   // Step 2: Storage auth (may be slow — run after catalog is connected)
-  status.innerHTML = '<span style="color:#f0c040">' + labels[provider] + ' catalog connected. Authenticating storage...</span>';
-  msg.textContent = 'Catalog connected. Setting up storage credentials...';
-  msg.style.color = '#3fb950';
-  try {
-    let authResult;
-    if (provider === 'gcs') {
-      authResult = await api('/api/auth');
-    } else if (provider === 'azure') {
-      authResult = await api('/api/azure_auth');
-    } else if (provider === 'aws') {
-      authResult = await api('/api/aws_auth', {
-        mode: 'keys',
-        access_key: '',  // Set via environment or UI
-        secret_key: '',  // Set via environment or UI
-        region: 'us-west-2'
-      });
-    }
+  // AWS Polaris vends S3 credentials automatically via the Iceberg REST protocol,
+  // so no separate storage auth step is needed.
+  if (provider === 'aws') {
     btn.disabled = false; btn.textContent = origText;
-    if (authResult && authResult.status === 'ok') {
-      status.innerHTML = '<span style="color:#3fb950">&#10003; ' + labels[provider] + ' connected (catalog + storage)</span>';
-    } else {
-      status.innerHTML = '<span style="color:#f0c040">&#10003; ' + labels[provider] + ' catalog connected. &#9888; Storage auth: ' + escHtml((authResult||{}).message||'failed') + '</span>';
+    status.innerHTML = '<span style="color:#3fb950">&#10003; ' + labels[provider] + ' connected (Polaris vends S3 credentials automatically)</span>';
+  } else {
+    status.innerHTML = '<span style="color:#f0c040">' + labels[provider] + ' catalog connected. Authenticating storage...</span>';
+    msg.textContent = 'Catalog connected. Setting up storage credentials...';
+    msg.style.color = '#3fb950';
+    try {
+      let authResult;
+      if (provider === 'gcs') {
+        authResult = await api('/api/auth');
+      } else if (provider === 'azure') {
+        authResult = await api('/api/azure_auth');
+      }
+      btn.disabled = false; btn.textContent = origText;
+      if (authResult && authResult.status === 'ok') {
+        status.innerHTML = '<span style="color:#3fb950">&#10003; ' + labels[provider] + ' connected (catalog + storage)</span>';
+      } else {
+        status.innerHTML = '<span style="color:#f0c040">&#10003; ' + labels[provider] + ' catalog connected. &#9888; Storage auth: ' + escHtml((authResult||{}).message||'failed') + '</span>';
+      }
+    } catch(e) {
+      btn.disabled = false; btn.textContent = origText;
+      status.innerHTML = '<span style="color:#f0c040">&#10003; ' + labels[provider] + ' catalog connected. &#9888; Storage auth error: ' + escHtml(e.message) + '</span>';
     }
-  } catch(e) {
-    btn.disabled = false; btn.textContent = origText;
-    status.innerHTML = '<span style="color:#f0c040">&#10003; ' + labels[provider] + ' catalog connected. &#9888; Storage auth error: ' + escHtml(e.message) + '</span>';
   }
 }
 function escAttr(s) { return s ? s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;') : ''; }
@@ -1648,6 +1805,23 @@ function loadPreset(key) {
   document.getElementById('polarisCatalog').value = p.catalog || '';
   document.getElementById('polarisClientId').value = p.client_id || '';
   document.getElementById('polarisClientSecret').value = p.client_secret || '';
+}
+
+async function restartServer() {
+  if (!confirm('Restart the server? The page will reload automatically.')) return;
+  const st = document.getElementById('authStatus');
+  st.textContent = 'Restarting...'; st.className = 'status pending';
+  try { await fetch(BASE_PATH + '/api/restart', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); } catch(e) {}
+  let attempts = 0;
+  const poll = setInterval(async () => {
+    attempts++;
+    st.textContent = 'Reconnecting... (' + attempts + ')';
+    try {
+      const r = await fetch(BASE_PATH + '/api/init', {signal: AbortSignal.timeout(2000)});
+      if (r.ok) { clearInterval(poll); location.reload(); }
+    } catch(e) {}
+    if (attempts > 30) { clearInterval(poll); st.textContent = 'Restart failed'; st.className = 'status error'; }
+  }, 2000);
 }
 
 function toggleCredPanel() {
@@ -2098,6 +2272,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"status": "error", "message": "Invalid JSON"})
                 return
             self.send_json(update_polaris_credentials(data))
+        elif route == "/api/restart":
+            self.send_json({"status": "ok", "message": "Restarting..."})
+            threading.Timer(0.5, lambda: os.system("systemctl restart gcs-explorer")).start()
         else:
             self.send_response(404)
             self.end_headers()
@@ -2354,6 +2531,7 @@ def main():
 
     init_duckdb()
 
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
     server = http.server.ThreadingHTTPServer((BIND_ADDR, PORT), Handler)
 
     # Wrap socket with SSL

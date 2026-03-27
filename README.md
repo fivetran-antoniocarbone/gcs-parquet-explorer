@@ -14,9 +14,12 @@ Sign in with your Fivetran email address to start browsing and querying data.
 
 - **GCS Parquet Browsing** — Navigate bucket directories, load Parquet files, view data and schemas
 - **Polaris Iceberg Catalogs** — One-click connect to Google Cloud, Azure, and AWS Polaris catalogs
+- **AWS S3 Vended Credentials** — Automatic S3 credential vending via Polaris REST API with query rewrite to `iceberg_scan()`
 - **DuckDB SQL Engine** — Full SQL queries with auto-load, autocomplete, and cross-catalog joins
+- **Query Timeout** — 45-second watchdog timer prevents queries from hanging forever on unauthorized tables
 - **Credential Management** — View and update Polaris OAuth credentials from the UI
 - **Multi-Threaded HTTPS Server** — Thread-safe DuckDB access, SSL/TLS, email-based login
+- **Restart Server Button** — One-click server restart from the web UI header
 - **Self-Healing** — systemd service with auto-restart on crash and start on boot
 - **Fast Catalog Browsing** — Polaris REST API for namespace/table listing (~0.3s vs 70s)
 - **Zero Client Dependencies** — Pure browser-based, no pandas or other client-side installs needed
@@ -70,6 +73,34 @@ Three pre-configured Polaris catalog presets with OAuth2 client credentials:
 
 Namespace and table listing uses the Polaris REST API directly (~0.3s) instead of DuckDB `information_schema` queries (~70s).
 
+### AWS S3 Vended Credentials & Query Rewrite
+
+DuckDB's Iceberg extension does **not** send the `X-Iceberg-Access-Delegation: vended-credentials`
+HTTP header when querying via `ATTACH ... TYPE ICEBERG`. Without this header, the Polaris REST
+catalog does not return S3 credentials in `loadTable` responses, causing data queries to hang.
+
+**Workaround** (transparent to the user): When a SQL query references an AWS Polaris catalog
+(e.g., `SELECT * FROM aws.namespace.table`), the server:
+
+1. Detects the AWS catalog reference via regex
+2. Resolves the table's `metadata-location` via the Polaris REST API with `X-Iceberg-Access-Delegation: vended-credentials`
+3. Extracts vended S3 credentials (`s3.access-key-id`, `s3.secret-access-key`, `s3.session-token`) from the response
+4. Creates a DuckDB S3 secret with those credentials
+5. Rewrites the query to use `iceberg_scan('s3://...metadata.json')` instead of the catalog reference
+
+This is handled by `_rewrite_aws_query()` and `_get_aws_polaris_token_and_creds()`. Vended credentials are cached for ~50 minutes.
+
+GCS and Azure do **not** need this — GCS uses `gcloud auth` (Application Default Credentials)
+and Azure uses `CREDENTIAL_CHAIN`, both providing storage auth independently of Polaris.
+
+### Query Timeout
+
+All SQL queries have a 45-second watchdog timer. If a query exceeds this limit (e.g., unauthorized Polaris table), `db_conn.interrupt()` is called from a background thread and the user sees: *"Query timed out after 45s. You may not have access to this table."*
+
+### Restart Server
+
+The web UI header includes a "Restart Server" link. It sends `POST /api/restart`, the server responds OK then triggers `systemctl restart gcs-explorer` via a 0.5s timer. The frontend polls `/api/init` every 2 seconds and auto-reloads when the server is back.
+
 ## Usage
 
 ### Getting Started
@@ -88,7 +119,7 @@ Namespace and table listing uses the Polaris REST API directly (~0.3s) instead o
 
 ### Polaris Iceberg Catalogs
 
-1. **Connect** — Go to the Polaris Catalog tab. Click **Google Cloud**, **Azure**, or **AWS** to connect the catalog and set up storage credentials in one step.
+1. **Connect** — Go to the Polaris Catalog tab. Click **Google Cloud**, **Azure**, or **AWS** to connect the catalog. GCS and Azure also set up storage credentials; AWS credentials are vended automatically at query time via the Polaris REST API.
 2. **Browse** — Click namespaces to see tables. Click a table name to populate the SQL tab, or the play icon to query immediately.
 3. **Query** — Tables are addressed as `<alias>.<namespace>.<table>`:
    ```sql
@@ -245,6 +276,7 @@ journalctl -u gcs-explorer -f          # Follow logs
 | Endpoint | Description |
 |----------|-------------|
 | `/api/login` | Email login, sets session cookie |
+| `/api/restart` | Restart the server via `systemctl restart gcs-explorer` |
 | `/api/polaris/update_credentials` | Update Polaris OAuth credentials at runtime |
 
 ## Dependencies
@@ -286,13 +318,16 @@ gcs-parquet-explorer/
 |---------|-----|
 | "Application Default Credentials" | Run `gcloud auth application-default login` on the server |
 | Azure storage error | Click Azure button (auto-configures credential chain) |
-| AWS S3 HTTP 400 | Click AWS button, check region matches bucket |
+| AWS queries hang forever | Fixed: queries are rewritten to `iceberg_scan()` with vended S3 credentials |
+| AWS queries fail after restart | Re-click the AWS button to re-attach the catalog (DuckDB state is in-memory) |
+| "Query timed out after 45s" | You may not have access to this table, or Polaris credentials expired |
 | DuckDB "Can't find home directory" | Fixed: `HOME` env var and `SET home_directory` set in init |
 | Azure SSL error on SUSE | Fixed: `SET azure_transport_option_type='curl'` configured |
 | Slow Polaris listing | Fixed: uses Polaris REST API (~0.3s instead of 70s) |
-| Port in use | `sudo systemctl restart gcs-explorer` |
+| Port in use | Fixed: `allow_reuse_address = True`; or click Restart Server in UI |
 | `no module named pandas` | Fixed: uses pure PyArrow, no pandas needed |
 | Server won't start under sudo | Use `/root/miniconda/bin/python3`, not `/usr/bin/python3` |
+| Logs not appearing | Fixed: `python3 -u` in systemd ExecStart for unbuffered output |
 | Browser shows "not secure" | Clear browser cache (ZeroSSL cert is valid) |
 
 ## Tested On
