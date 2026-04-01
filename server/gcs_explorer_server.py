@@ -18,14 +18,18 @@ import http.server
 import http.cookies
 import io
 import json
+import multiprocessing
 import os
 import psutil
+import queue
 import secrets
 import ssl
 import sys
+import time
 import threading
 import urllib.parse
 import urllib.request
+import uuid
 from collections import OrderedDict
 from datetime import datetime
 
@@ -180,8 +184,194 @@ CATALOG_PRESETS = {
 
 # Global state
 gcs_client = None
-db_conn = None
-db_lock = threading.Lock()  # DuckDB connections are not thread-safe
+_server_start_time = time.time()
+
+
+# ── DuckDB Subprocess Worker ──────────────────────────────────────────────────
+# DuckDB's C extension holds the Python GIL during network I/O (ATTACH ICEBERG,
+# iceberg_scan over S3). This freezes ALL Python threads — including the HTTP
+# server. Moving DuckDB into a child process isolates its GIL from the server.
+# The main process communicates via multiprocessing.Queue (command/response).
+
+def _duckdb_worker(cmd_q, resp_q):
+    """Subprocess entry point. Owns the DuckDB connection — no other process touches it."""
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    import duckdb as _ddb
+    import pyarrow as _pa
+    import pyarrow.ipc as _ipc
+
+    db = None
+    arrow_tables = {}  # name -> pyarrow.Table (prevent GC so DuckDB references stay valid)
+
+    while True:
+        try:
+            cmd = cmd_q.get(timeout=5)
+        except Exception:
+            continue
+        cmd_id = cmd.get("id", "")
+        cmd_name = cmd.get("cmd", "")
+        args = cmd.get("args", {})
+        try:
+            if cmd_name == "init":
+                if not os.environ.get("HOME"):
+                    os.environ["HOME"] = "/root"
+                db = _ddb.connect(":memory:")
+                db.execute(f"SET home_directory='{os.environ['HOME']}';")
+                db.execute("INSTALL httpfs; LOAD httpfs;")
+                db.execute("INSTALL iceberg; LOAD iceberg;")
+                db.execute("INSTALL azure; LOAD azure;")
+                db.execute("SET azure_transport_option_type='curl';")
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+
+            elif cmd_name == "exec_sql":
+                q = args["query"]
+                r = db.execute(q)
+                cols = [desc[0] for desc in r.description] if r.description else []
+                data = r.fetchall()
+                # Convert to strings for safe serialization
+                safe = []
+                for row in data:
+                    safe.append([str(v) if v is not None else "" for v in row])
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {"cols": cols, "data": safe}})
+
+            elif cmd_name == "exec_multi":
+                # Execute multiple SQL statements (no result needed)
+                for stmt in args["statements"]:
+                    db.execute(stmt)
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+
+            elif cmd_name == "register_table":
+                name = args["name"]
+                ipc_bytes = args["ipc_bytes"]
+                reader = _ipc.open_stream(ipc_bytes)
+                table = reader.read_all()
+                arrow_tables[name] = table
+                db.register(name, table)
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+
+            elif cmd_name == "unregister_table":
+                name = args["name"]
+                try:
+                    db.unregister(name)
+                except Exception:
+                    pass
+                arrow_tables.pop(name, None)
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+
+            elif cmd_name == "interrupt":
+                try:
+                    db.interrupt()
+                except Exception:
+                    pass
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+
+            elif cmd_name == "shutdown":
+                resp_q.put({"id": cmd_id, "status": "ok", "result": {}})
+                break
+
+            else:
+                resp_q.put({"id": cmd_id, "status": "error", "error": f"Unknown command: {cmd_name}"})
+
+        except Exception as e:
+            resp_q.put({"id": cmd_id, "status": "error", "error": str(e)})
+
+
+def _serialize_arrow_table(table):
+    """Serialize a PyArrow table to IPC bytes for cross-process transfer."""
+    import pyarrow as _pa
+    import pyarrow.ipc as _ipc
+    sink = _pa.BufferOutputStream()
+    writer = _ipc.new_stream(sink, table.schema)
+    writer.write_table(table)
+    writer.close()
+    return sink.getvalue().to_pybytes()
+
+
+class DuckDBWorker:
+    """Main-process client for the DuckDB subprocess. Thread-safe — multiple HTTP
+    handler threads can call send_command concurrently; commands are serialized
+    in the subprocess (one at a time via Queue)."""
+
+    def __init__(self):
+        self._cmd_q = None
+        self._resp_q = None
+        self._proc = None
+        self._pending = {}  # cmd_id -> {"event": Event, "result": dict}
+        self._reader_thread = None
+
+    def start(self):
+        """Spawn (or respawn) the subprocess and initialize DuckDB."""
+        self._cmd_q = multiprocessing.Queue()
+        self._resp_q = multiprocessing.Queue()
+        self._proc = multiprocessing.Process(
+            target=_duckdb_worker,
+            args=(self._cmd_q, self._resp_q),
+            daemon=True
+        )
+        self._proc.start()
+        # Background thread dispatches responses to waiters
+        self._reader_thread = threading.Thread(target=self._response_reader, daemon=True)
+        self._reader_thread.start()
+        # Initialize DuckDB in the subprocess
+        self.send_command("init", {}, timeout=30)
+        print("  DuckDB extensions: httpfs, iceberg, azure loaded (azure transport: curl)")
+
+    def send_command(self, cmd, args, timeout=60):
+        """Send a command and block until response or timeout.
+        On timeout, kills the subprocess and respawns."""
+        cmd_id = str(uuid.uuid4())
+        event = threading.Event()
+        self._pending[cmd_id] = {"event": event, "result": None}
+        self._cmd_q.put({"id": cmd_id, "cmd": cmd, "args": args})
+        if not event.wait(timeout=timeout):
+            # Subprocess is hung — kill and respawn
+            self._kill_and_respawn()
+            self._pending.pop(cmd_id, None)
+            raise Exception(f"DuckDB operation timed out after {timeout}s — worker restarted.")
+        result = self._pending.pop(cmd_id, {}).get("result", {})
+        if result.get("status") == "error":
+            raise Exception(result.get("error", "Unknown error"))
+        return result.get("result")
+
+    def _response_reader(self):
+        """Background thread that reads responses and wakes waiting callers."""
+        while True:
+            try:
+                resp = self._resp_q.get(timeout=2)
+            except Exception:
+                if self._proc and not self._proc.is_alive():
+                    # Worker died unexpectedly — wake all waiters
+                    for entry in self._pending.values():
+                        entry["result"] = {"status": "error", "error": "DuckDB worker crashed"}
+                        entry["event"].set()
+                    self._pending.clear()
+                continue
+            pending = self._pending.get(resp.get("id"))
+            if pending:
+                pending["result"] = resp
+                pending["event"].set()
+
+    def _kill_and_respawn(self):
+        """Kill a hung subprocess and start a fresh one."""
+        print("  WORKER: DuckDB subprocess timed out — killing and respawning...")
+        if self._proc and self._proc.is_alive():
+            self._proc.kill()
+            self._proc.join(timeout=5)
+        # Wake all pending waiters with error
+        for entry in self._pending.values():
+            entry["result"] = {"status": "error", "error": "Worker restarted due to timeout"}
+            entry["event"].set()
+        self._pending.clear()
+        # Clear main-process state that references dead subprocess
+        loaded_tables.clear()
+        polaris_catalogs.clear()
+        print("  WORKER: All tables and catalog connections lost — respawning...")
+        self.start()
+
+
+duckdb_worker = None  # initialized in main()
 current_bucket = BUCKET_NAME  # active bucket (can change at runtime)
 polaris_catalogs = {}  # alias -> {"endpoint":..., "catalog":..., "connected": True}
 # Cache loaded tables for SQL queries: name -> pyarrow table (ordered by load time for LRU eviction)
@@ -211,13 +401,12 @@ def _maybe_evict():
     """Evict oldest loaded tables until system memory usage drops below threshold."""
     mem = psutil.virtual_memory()
     while mem.percent / 100.0 >= MEMORY_THRESHOLD and loaded_tables:
-        name, tbl = loaded_tables.popitem(last=False)  # oldest first
+        name, meta = loaded_tables.popitem(last=False)  # oldest first
         try:
-            db_conn.unregister(name)
+            duckdb_worker.send_command("unregister_table", {"name": name}, timeout=10)
         except Exception:
             pass
-        mb = tbl.nbytes / (1024 * 1024)
-        del tbl
+        mb = meta.get("nbytes", 0) / (1024 * 1024) if isinstance(meta, dict) else 0
         mem = psutil.virtual_memory()
         print(f"  Evicted table '{name}' (~{mb:.1f} MB) — memory now at {mem.percent:.0f}%")
 
@@ -253,51 +442,44 @@ def list_buckets():
 
 
 def init_duckdb():
-    """Initialize DuckDB in-memory connection with Iceberg extensions."""
-    global db_conn
-    # Ensure HOME is set — systemd services may not have it
-    if not os.environ.get("HOME"):
-        os.environ["HOME"] = "/root"
-    db_conn = duckdb.connect(":memory:")
-    try:
-        db_conn.execute(f"SET home_directory='{os.environ['HOME']}';")
-        db_conn.execute("INSTALL httpfs; LOAD httpfs;")
-        db_conn.execute("INSTALL iceberg; LOAD iceberg;")
-        db_conn.execute("INSTALL azure; LOAD azure;")
-        db_conn.execute("SET azure_transport_option_type='curl';")
-        print("  DuckDB extensions: httpfs, iceberg, azure loaded (azure transport: curl)")
-    except Exception as e:
-        print(f"  Warning: Could not load extensions: {e}")
+    """Start the DuckDB subprocess worker."""
+    global duckdb_worker
+    duckdb_worker = DuckDBWorker()
+    duckdb_worker.start()
 
 
 def connect_polaris(alias, endpoint, catalog, client_id, client_secret):
     """Connect to a Polaris Iceberg catalog via DuckDB with a given alias."""
     if not alias or not endpoint or not catalog or not client_id or not client_secret:
         return {"status": "error", "message": "All fields are required"}
-    # Sanitize alias for use as DuckDB identifier
     safe_alias = alias.replace("-", "_").replace(" ", "_").lower()
+    # Skip if already connected with same catalog
+    existing = polaris_catalogs.get(safe_alias)
+    if existing and existing.get("catalog") == catalog and existing.get("endpoint") == endpoint:
+        print(f"  Catalog '{safe_alias}' already connected, skipping re-attach")
+        return {"status": "ok", "alias": safe_alias, "message": f"Already connected: {safe_alias} ({catalog}). Query as: {safe_alias}.<namespace>.<table>"}
     secret_name = f"secret_{safe_alias}"
     oauth_uri = endpoint.rstrip("/") + "/v1/oauth/tokens"
     try:
-        with db_lock:
-            db_conn.execute(f"DETACH DATABASE IF EXISTS {safe_alias};")
-            db_conn.execute(f"DROP SECRET IF EXISTS {secret_name};")
-            db_conn.execute(f"""
-                CREATE SECRET {secret_name} (
-                    TYPE iceberg,
-                    CLIENT_ID '{client_id}',
-                    CLIENT_SECRET '{client_secret}',
-                    OAUTH2_SCOPE 'PRINCIPAL_ROLE:ALL',
-                    OAUTH2_SERVER_URI '{oauth_uri}'
-                );
-            """)
-            db_conn.execute(f"""
-                ATTACH '{catalog}' AS {safe_alias} (
-                    TYPE ICEBERG,
-                    ENDPOINT '{endpoint}',
-                    SECRET {secret_name}
-                );
-            """)
+        # 65s timeout — ATTACH TYPE ICEBERG makes network calls that can hang.
+        # If it hangs, send_command kills and respawns the subprocess instead of
+        # freezing the entire server (the old GIL-blocking problem).
+        duckdb_worker.send_command("exec_multi", {"statements": [
+            f"DETACH DATABASE IF EXISTS {safe_alias};",
+            f"DROP SECRET IF EXISTS {secret_name};",
+            f"""CREATE SECRET {secret_name} (
+                TYPE iceberg,
+                CLIENT_ID '{client_id}',
+                CLIENT_SECRET '{client_secret}',
+                OAUTH2_SCOPE 'PRINCIPAL_ROLE:ALL',
+                OAUTH2_SERVER_URI '{oauth_uri}'
+            );""",
+            f"""ATTACH '{catalog}' AS {safe_alias} (
+                TYPE ICEBERG,
+                ENDPOINT '{endpoint}',
+                SECRET {secret_name}
+            );""",
+        ]}, timeout=65)
         polaris_catalogs[safe_alias] = {"endpoint": endpoint, "catalog": catalog, "alias": safe_alias,
                                         "client_id": client_id, "client_secret": client_secret}
         print(f"  Catalog '{safe_alias}' ({catalog}) attached")
@@ -310,9 +492,10 @@ def disconnect_polaris(alias):
     """Disconnect a Polaris catalog."""
     safe_alias = alias.replace("-", "_").replace(" ", "_").lower()
     try:
-        with db_lock:
-            db_conn.execute(f"DETACH DATABASE IF EXISTS {safe_alias};")
-            db_conn.execute(f"DROP SECRET IF EXISTS secret_{safe_alias};")
+        duckdb_worker.send_command("exec_multi", {"statements": [
+            f"DETACH DATABASE IF EXISTS {safe_alias};",
+            f"DROP SECRET IF EXISTS secret_{safe_alias};",
+        ]}, timeout=15)
         polaris_catalogs.pop(safe_alias, None)
         return {"status": "ok", "message": f"Disconnected: {safe_alias}"}
     except Exception as e:
@@ -351,7 +534,6 @@ _s3_vended_cache = {}  # alias -> {"token": str, "expires": float, "s3_creds": d
 
 def _get_aws_polaris_token_and_creds(alias):
     """Get or refresh OAuth token + S3 vended credentials for an AWS Polaris catalog."""
-    import time
     cache = _s3_vended_cache.get(alias, {})
     if cache.get("expires", 0) > time.time() and cache.get("s3_creds"):
         return cache["token"], cache["s3_creds"]
@@ -384,17 +566,16 @@ def _get_aws_polaris_token_and_creds(alias):
         sk = s3_creds.get("s3.secret-access-key", "")
         st = s3_creds.get("s3.session-token", "")
         if ak and sk:
-            with db_lock:
-                db_conn.execute(f"DROP SECRET IF EXISTS s3_vended_{alias};")
-                db_conn.execute(f"""
-                    CREATE SECRET s3_vended_{alias} (
-                        TYPE S3,
-                        KEY_ID '{ak}',
-                        SECRET '{sk}',
-                        SESSION_TOKEN '{st}',
-                        REGION 'us-west-2'
-                    );
-                """)
+            duckdb_worker.send_command("exec_multi", {"statements": [
+                f"DROP SECRET IF EXISTS s3_vended_{alias};",
+                f"""CREATE SECRET s3_vended_{alias} (
+                    TYPE S3,
+                    KEY_ID '{ak}',
+                    SECRET '{sk}',
+                    SESSION_TOKEN '{st}',
+                    REGION 'us-west-2'
+                );""",
+            ]}, timeout=15)
             print(f"  S3 vended credentials refreshed for catalog '{alias}'")
         return token, s3_creds
     except Exception as e:
@@ -463,17 +644,16 @@ def _rewrite_aws_query(query):
             sk = cfg.get("s3.secret-access-key", "")
             st = cfg.get("s3.session-token", "")
             if ak and sk:
-                with db_lock:
-                    db_conn.execute(f"DROP SECRET IF EXISTS s3_vended_{target_alias};")
-                    db_conn.execute(f"""
-                        CREATE SECRET s3_vended_{target_alias} (
-                            TYPE S3,
-                            KEY_ID '{ak}',
-                            SECRET '{sk}',
-                            SESSION_TOKEN '{st}',
-                            REGION 'us-west-2'
-                        );
-                    """)
+                duckdb_worker.send_command("exec_multi", {"statements": [
+                    f"DROP SECRET IF EXISTS s3_vended_{target_alias};",
+                    f"""CREATE SECRET s3_vended_{target_alias} (
+                        TYPE S3,
+                        KEY_ID '{ak}',
+                        SECRET '{sk}',
+                        SESSION_TOKEN '{st}',
+                        REGION 'us-west-2'
+                    );""",
+                ]}, timeout=15)
         except Exception as e:
             print(f"  WARNING: Failed to resolve {target_alias}.{namespace}.{table}: {e}")
 
@@ -661,21 +841,21 @@ def read_parquet(blob_path):
         blob = bucket.blob(blob_path)
         data = blob.download_as_bytes()
         table = pq.read_table(io.BytesIO(data))
-        # Register in DuckDB for SQL queries
+
         table_name = blob_path.split("/")[-1].replace(".parquet", "").replace("-", "_")
-        # Also register by directory name
         parts = blob_path.split("/")
         dir_name = table_name
         if len(parts) >= 3:
             dir_name = parts[-3] if parts[-2] == "data" else parts[-2]
             dir_name = dir_name.replace("-", "_")
-            loaded_tables[dir_name] = table
-            with db_lock:
-                db_conn.register(dir_name, table)
 
-        loaded_tables[table_name] = table
-        with db_lock:
-            db_conn.register(table_name, table)
+        # Serialize and send to DuckDB subprocess for registration
+        ipc_bytes = _serialize_arrow_table(table)
+        if dir_name != table_name:
+            duckdb_worker.send_command("register_table", {"name": dir_name, "ipc_bytes": ipc_bytes}, timeout=30)
+            loaded_tables[dir_name] = {"rows": table.num_rows, "columns": list(table.column_names), "nbytes": table.nbytes}
+        duckdb_worker.send_command("register_table", {"name": table_name, "ipc_bytes": ipc_bytes}, timeout=30)
+        loaded_tables[table_name] = {"rows": table.num_rows, "columns": list(table.column_names), "nbytes": table.nbytes}
 
         columns = [field.name for field in table.schema]
         num_rows = table.num_rows
@@ -719,13 +899,14 @@ def read_all_parquets_in_dir(dir_path):
 
         combined = pyarrow.concat_tables(tables)
 
-        # Register for SQL
         parts = dir_path.rstrip("/").split("/")
         dir_name = parts[-1] if parts[-1] != "data" else parts[-2]
         dir_name = dir_name.replace("-", "_")
-        loaded_tables[dir_name] = combined
-        with db_lock:
-            db_conn.register(dir_name, combined)
+
+        # Serialize and send to DuckDB subprocess
+        ipc_bytes = _serialize_arrow_table(combined)
+        duckdb_worker.send_command("register_table", {"name": dir_name, "ipc_bytes": ipc_bytes}, timeout=30)
+        loaded_tables[dir_name] = {"rows": combined.num_rows, "columns": list(combined.column_names), "nbytes": combined.nbytes}
 
         columns = [field.name for field in combined.schema]
         num_rows = combined.num_rows
@@ -779,9 +960,9 @@ def auto_load_table(table_name, browse_prefix=""):
                     data = blob.download_as_bytes()
                     tables.append(pq.read_table(io.BytesIO(data)))
                 combined = pyarrow.concat_tables(tables) if len(tables) > 1 else tables[0]
-                loaded_tables[search_name] = combined
-                with db_lock:
-                    db_conn.register(search_name, combined)
+                ipc_bytes = _serialize_arrow_table(combined)
+                duckdb_worker.send_command("register_table", {"name": search_name, "ipc_bytes": ipc_bytes}, timeout=30)
+                loaded_tables[search_name] = {"rows": combined.num_rows, "columns": list(combined.column_names), "nbytes": combined.nbytes}
                 print(f"  Auto-loaded: {search_name} ({combined.num_rows} rows)")
                 return True
         return False
@@ -801,27 +982,10 @@ def _extract_missing_table(error_msg):
 def run_sql(query, browse_prefix=""):
     """Execute a SQL query via DuckDB. Auto-loads tables from GCS if not found."""
     def _exec(q, timeout_sec=45):
-        cancelled = [False]
-        def watchdog():
-            cancelled[0] = True
-            try:
-                db_conn.interrupt()
-            except Exception:
-                pass
-        timer = threading.Timer(timeout_sec, watchdog)
-        timer.start()
-        try:
-            with db_lock:
-                r = db_conn.execute(q)
-                cols = [desc[0] for desc in r.description] if r.description else []
-                data = r.fetchall()
-        except Exception as e:
-            if cancelled[0]:
-                raise Exception("Query timed out after {}s. You may not have access to this table.".format(timeout_sec))
-            raise
-        finally:
-            timer.cancel()
-        return cols, data
+        # send_command timeout is timeout_sec + 5s buffer so the subprocess can
+        # return its own error before the main process kills it
+        result = duckdb_worker.send_command("exec_sql", {"query": q}, timeout=timeout_sec + 5)
+        return result["cols"], result["data"]
 
     # Rewrite AWS Polaris queries to use iceberg_scan() with vended S3 credentials
     query = _rewrite_aws_query(query)
@@ -889,13 +1053,22 @@ def read_file_text(blob_path):
 def get_loaded_tables():
     """Return list of tables registered in DuckDB."""
     tables = []
-    for name, tbl in loaded_tables.items():
-        tables.append({
-            "name": name,
-            "rows": tbl.num_rows,
-            "columns": len(tbl.column_names),
-            "column_names": list(tbl.column_names)
-        })
+    for name, meta in loaded_tables.items():
+        if isinstance(meta, dict):
+            tables.append({
+                "name": name,
+                "rows": meta.get("rows", 0),
+                "columns": len(meta.get("columns", [])),
+                "column_names": meta.get("columns", [])
+            })
+        else:
+            # Legacy: meta is a PyArrow table (shouldn't happen after refactor)
+            tables.append({
+                "name": name,
+                "rows": meta.num_rows,
+                "columns": len(meta.column_names),
+                "column_names": list(meta.column_names)
+            })
     return {"status": "ok", "tables": tables}
 
 
@@ -3565,6 +3738,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        try:
+            self._do_POST()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected — ignore silently
+
+    def _do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         route = self._strip_base(parsed.path)
         if route is None:
@@ -3602,12 +3781,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(update_polaris_credentials(data))
         elif route == "/api/restart":
             self.send_json({"status": "ok", "message": "Restarting..."})
-            threading.Timer(0.5, lambda: os.system("systemctl restart gcs-explorer-dev")).start()
+            threading.Timer(0.5, lambda: os.system("systemctl restart gcs-explorer")).start()
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
+        try:
+            self._do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # Client disconnected — ignore silently
+
+    def _do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = dict(urllib.parse.parse_qsl(parsed.query))
 
@@ -3650,6 +3835,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", BASE_PATH + "/login")
             self.send_header("Set-Cookie", "session=; Path=/; HttpOnly; Secure; Max-Age=0")
             self.end_headers()
+            return
+
+        # Health check — no auth required, no db_lock, no GCS calls
+        if route == "/api/health":
+            self.send_json({"status": "ok", "uptime": int(time.time() - _server_start_time)})
             return
 
         # All other routes require auth
@@ -3764,14 +3954,13 @@ def run_gcloud_auth():
 def run_azure_auth():
     """Create DuckDB Azure credential chain secret."""
     try:
-        with db_lock:
-            db_conn.execute("DROP SECRET IF EXISTS azure_storage_secret;")
-            db_conn.execute("""
-                CREATE SECRET azure_storage_secret (
-                    TYPE AZURE,
-                    PROVIDER CREDENTIAL_CHAIN
-                );
-            """)
+        duckdb_worker.send_command("exec_multi", {"statements": [
+            "DROP SECRET IF EXISTS azure_storage_secret;",
+            """CREATE SECRET azure_storage_secret (
+                TYPE AZURE,
+                PROVIDER CREDENTIAL_CHAIN
+            );""",
+        ]}, timeout=15)
         print("  Azure credential chain secret created")
         return {"status": "ok", "message": "Azure storage credentials configured."}
     except Exception as e:
@@ -3801,19 +3990,18 @@ def run_aws_auth(mode="keys", access_key="", secret_key="", region="us-west-2", 
             ak = creds["AccessKeyId"]
             sk = creds["SecretAccessKey"]
             token = creds["SessionToken"]
-            with db_lock:
-                db_conn.execute("DROP SECRET IF EXISTS aws_storage_secret;")
-                db_conn.execute(f"""
-                    CREATE SECRET aws_storage_secret (
-                        TYPE S3,
-                        KEY_ID '{ak}',
-                        SECRET '{sk}',
-                        SESSION_TOKEN '{token}',
-                        REGION '{region}',
-                        ENDPOINT 's3.{region}.amazonaws.com',
-                        URL_STYLE 'vhost'
-                    );
-                """)
+            duckdb_worker.send_command("exec_multi", {"statements": [
+                "DROP SECRET IF EXISTS aws_storage_secret;",
+                f"""CREATE SECRET aws_storage_secret (
+                    TYPE S3,
+                    KEY_ID '{ak}',
+                    SECRET '{sk}',
+                    SESSION_TOKEN '{token}',
+                    REGION '{region}',
+                    ENDPOINT 's3.{region}.amazonaws.com',
+                    URL_STYLE 'vhost'
+                );""",
+            ]}, timeout=15)
             print(f"  AWS S3 secret created via assume-role (region: {region})")
             return {"status": "ok", "message": f"Role assumed successfully (region: {region}). Temporary credentials expire in 1 hour."}
         except FileNotFoundError:
@@ -3826,24 +4014,22 @@ def run_aws_auth(mode="keys", access_key="", secret_key="", region="us-west-2", 
         if not access_key or not secret_key:
             return {"status": "error", "message": "Access Key ID and Secret Access Key are required"}
         try:
-            with db_lock:
-                db_conn.execute("DROP SECRET IF EXISTS aws_storage_secret;")
-                db_conn.execute(f"""
-                    CREATE SECRET aws_storage_secret (
-                        TYPE S3,
-                        KEY_ID '{access_key}',
-                        SECRET '{secret_key}',
-                        REGION '{region}',
-                        ENDPOINT 's3.{region}.amazonaws.com',
-                        URL_STYLE 'vhost'
-                    );
-                """)
-                # Also set global S3 config for httpfs/iceberg extension
-                db_conn.execute(f"SET s3_region='{region}';")
-                db_conn.execute(f"SET s3_access_key_id='{access_key}';")
-                db_conn.execute(f"SET s3_secret_access_key='{secret_key}';")
-                db_conn.execute(f"SET s3_endpoint='s3.{region}.amazonaws.com';")
-                db_conn.execute("SET s3_url_style='vhost';")
+            duckdb_worker.send_command("exec_multi", {"statements": [
+                "DROP SECRET IF EXISTS aws_storage_secret;",
+                f"""CREATE SECRET aws_storage_secret (
+                    TYPE S3,
+                    KEY_ID '{access_key}',
+                    SECRET '{secret_key}',
+                    REGION '{region}',
+                    ENDPOINT 's3.{region}.amazonaws.com',
+                    URL_STYLE 'vhost'
+                );""",
+                f"SET s3_region='{region}';",
+                f"SET s3_access_key_id='{access_key}';",
+                f"SET s3_secret_access_key='{secret_key}';",
+                f"SET s3_endpoint='s3.{region}.amazonaws.com';",
+                "SET s3_url_style='vhost';",
+            ]}, timeout=15)
             print(f"  AWS S3 secret + global config set (region: {region})")
             return {"status": "ok", "message": f"AWS authentication successful (region: {region})."}
         except Exception as e:
@@ -3858,6 +4044,7 @@ def main():
     init_duckdb()
 
     http.server.ThreadingHTTPServer.allow_reuse_address = True
+    http.server.ThreadingHTTPServer.request_queue_size = 64  # default 5 is too low — blocks new connections when db_lock is contended
     server = http.server.ThreadingHTTPServer((BIND_ADDR, PORT), Handler)
 
     # Wrap socket with SSL
@@ -3875,6 +4062,7 @@ def main():
     print(f"Server: {proto}://{FQDN}{BASE_PATH}/")
     print(f"Login with your email + password")
     print("Ctrl+C to stop")
+    print(f"  DuckDB running in subprocess (PID {duckdb_worker._proc.pid})")
 
     try:
         server.serve_forever()
