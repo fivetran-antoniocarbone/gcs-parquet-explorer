@@ -843,11 +843,15 @@ def read_parquet(blob_path):
         table = pq.read_table(io.BytesIO(data))
 
         table_name = blob_path.split("/")[-1].replace(".parquet", "").replace("-", "_")
+        if table_name[0:1].isdigit():
+            table_name = "t_" + table_name
         parts = blob_path.split("/")
         dir_name = table_name
         if len(parts) >= 3:
             dir_name = parts[-3] if parts[-2] == "data" else parts[-2]
             dir_name = dir_name.replace("-", "_")
+            if dir_name[0:1].isdigit():
+                dir_name = "t_" + dir_name
 
         # Serialize and send to DuckDB subprocess for registration
         ipc_bytes = _serialize_arrow_table(table)
@@ -902,6 +906,8 @@ def read_all_parquets_in_dir(dir_path):
         parts = dir_path.rstrip("/").split("/")
         dir_name = parts[-1] if parts[-1] != "data" else parts[-2]
         dir_name = dir_name.replace("-", "_")
+        if dir_name[0:1].isdigit():
+            dir_name = "t_" + dir_name
 
         # Serialize and send to DuckDB subprocess
         ipc_bytes = _serialize_arrow_table(combined)

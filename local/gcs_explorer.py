@@ -344,11 +344,15 @@ def read_parquet(blob_path):
 
         # Register in DuckDB for SQL queries
         table_name = blob_path.split("/")[-1].replace(".parquet", "").replace("-", "_")
+        if table_name[0:1].isdigit():
+            table_name = "t_" + table_name
         # Also register by directory name
         parts = blob_path.split("/")
         if len(parts) >= 3:
             dir_name = parts[-3] if parts[-2] == "data" else parts[-2]
             dir_name = dir_name.replace("-", "_")
+            if dir_name[0:1].isdigit():
+                dir_name = "t_" + dir_name
             loaded_tables[dir_name] = table
             db_conn.register(dir_name, table)
 
@@ -400,6 +404,8 @@ def read_all_parquets_in_dir(dir_path):
         parts = dir_path.rstrip("/").split("/")
         dir_name = parts[-1] if parts[-1] != "data" else parts[-2]
         dir_name = dir_name.replace("-", "_")
+        if dir_name[0:1].isdigit():
+            dir_name = "t_" + dir_name
         loaded_tables[dir_name] = combined
         db_conn.register(dir_name, combined)
 
