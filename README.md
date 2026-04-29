@@ -17,7 +17,8 @@ Sign in with your Fivetran email address to start browsing and querying data.
 - **AWS S3 Vended Credentials** — Automatic S3 credential vending via Polaris REST API with query rewrite to `iceberg_scan()`
 - **DuckDB SQL Engine** — Full SQL queries with auto-load, autocomplete, and cross-catalog joins
 - **Query Timeout** — 45-second watchdog timer prevents queries from hanging forever on unauthorized tables
-- **Credential Management** — View and update Polaris OAuth credentials from the UI
+- **Per-User Polaris Credentials** *(Portal deployment)* — Each signed-in user gets a private credential overlay and their own DuckDB worker, so two users with two different Polaris scopes don't see each other's catalogs, tables, or vended S3 keys. "Reset to Defaults" reverts to the shared baseline
+- **Credential Management** — View and update Polaris OAuth credentials from the UI (per-user in the Portal deployment; in-memory shared in the standalone)
 - **Multi-Threaded HTTPS Server** — Thread-safe DuckDB access, SSL/TLS, email-based login
 - **Restart Server Button** — One-click server restart from the web UI header
 - **Self-Healing** — systemd service with auto-restart on crash and start on boot
@@ -139,7 +140,31 @@ The web UI header includes a "Restart Server" link. It sends `POST /api/restart`
 
 ### Managing Credentials
 
-Click the yellow **Manage Credentials** button in the Polaris Catalog tab to view and update OAuth client credentials for each cloud provider. Changes persist in memory until server restart.
+Click the **Manage Credentials** button in the Polaris Catalog tab to view and update OAuth client credentials for each cloud provider.
+
+**Standalone deployment:** changes mutate the in-memory `CATALOG_PRESETS` dict and persist until server restart.
+
+**Portal deployment (live instance):** changes are scoped to your account only.
+
+- **Save Credentials** writes a private overlay row to a Postgres table (`user_polaris_creds`), encrypted column-wise with `pgcrypto`, joined to the `users` table by email.
+- **Reset to Defaults** removes your overlay so you fall back to the shared baseline.
+- A small caption under the form tells you whether you're currently using the shared baseline or your personal overlay.
+- Other users are never affected. New users are auto-seeded with a copy of the shared baseline on first sign-in (or on Okta JIT provisioning).
+
+### Per-User DuckDB Workers (Portal deployment)
+
+In the live (Portal) deployment, the DuckDB engine is **per-user** rather than singleton. Every logged-in user gets their own subprocess, lazily spawned on the first DuckDB-touching request, with their own ATTACHed Polaris catalogs, registered tables, and storage secrets (S3 / Azure / GCS). This guarantees that two users with two different Polaris scopes can be connected at the same time without their credentials, vended S3 keys, or attached catalogs leaking across each other.
+
+| Worker lifecycle event | Behaviour |
+|---|---|
+| First `/api/polaris/connect` or `/api/sql` for a user | Lazy spawn |
+| `/auth/logout` | Worker killed immediately |
+| Idle ≥ 30 min | Reaped by background thread |
+| `>10` workers active *or* memory ≥ 85 % | LRU eviction |
+| Hung query | Per-user kill + respawn (other users unaffected) |
+| `systemctl restart gcs-explorer` | All workers die together (existing behaviour) |
+
+The standalone version in this repository keeps the original singleton-worker design — the per-user split requires a user model and a Postgres-backed credentials table that don't exist outside the Portal.
 
 ## Deployment
 
