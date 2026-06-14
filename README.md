@@ -12,6 +12,7 @@ Sign in with your Fivetran email address to start browsing and querying data.
 
 ## Features
 
+- **Three Parquet Explorers** *(Portal build v198+)* — GCS, Azure ADLS (`pyarrow.fs.AzureFileSystem`, vault `azure_storage_ts`), and AWS S3 (`boto3` listing + per-bucket region detection, vault `aws_storage_s3`) all share one DOM via `currentProvider` variable; one-click switching between providers
 - **GCS Parquet Browsing** — Navigate bucket directories, load Parquet files, view data and schemas
 - **Polaris Iceberg Catalogs** — One-click connect to Google Cloud, Azure, and AWS Polaris catalogs
 - **AWS S3 Vended Credentials** — Automatic S3 credential vending via Polaris REST API with query rewrite to `iceberg_scan()`
@@ -24,7 +25,7 @@ Sign in with your Fivetran email address to start browsing and querying data.
 - **Self-Healing** — systemd service with auto-restart on crash and start on boot
 - **Fast Catalog Browsing** — Polaris REST API for namespace/table listing (~0.3s vs 70s)
 - **Zero Client Dependencies** — Pure browser-based, no pandas or other client-side installs needed
-- **Dark Theme UI** — Interactive data tables, sidebar file browser, resizable panels
+- **Fivetran Light Theme UI** — Interactive data tables, sidebar file browser, resizable panels
 
 ## Architecture
 
@@ -60,7 +61,9 @@ Single-file Python application with embedded HTML/CSS/JS frontend:
 | Auth | Email-based login with secure session cookies |
 | SSL | ZeroSSL certificate with chained PEM |
 | Process Mgmt | systemd (auto-restart on crash, start on boot) |
-| UI | Embedded HTML/CSS/JS, dark theme, no frameworks |
+| UI | Embedded HTML/CSS/JS, Fivetran light theme, no frameworks |
+| Azure direct browse | `pyarrow.fs.AzureFileSystem` (`azure_storage_ts` vault) |
+| AWS S3 direct browse | `boto3` listing + PyArrow `S3FileSystem` per-bucket region (`aws_storage_s3` vault) |
 
 ### Polaris Iceberg Catalogs
 
