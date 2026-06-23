@@ -985,6 +985,48 @@ def _extract_missing_table(error_msg):
     return m.group(1).strip('"').lower() if m else None
 
 
+def _ensure_polaris_attached(query):
+    """Self-heal Polaris catalog attaches after a worker respawn.
+
+    The DuckDB subprocess loses every ATTACH + storage secret when it is killed
+    and respawned after a hung query (polaris_catalogs is cleared too), yet the
+    browser still shows the catalog as "Connected" (frontend state is client-side
+    and never refreshed). Without this, the next query fails with
+    'Binder Error: Catalog "..." does not exist!'.
+
+    For any known catalog alias referenced by this query but not currently
+    attached, transparently re-attach it (and re-establish the storage secret)
+    from CATALOG_PRESETS — exactly what the frontend's connectCloud() does.
+
+      - azure: re-ATTACH + recreate azure_storage_secret (CREDENTIAL_CHAIN) — both
+               are subprocess state lost on respawn.
+      - gcs:   re-ATTACH only — GCS storage auth is filesystem ADC, survives respawn.
+      - aws:   re-ATTACH only — vended S3 creds are re-fetched at query time by
+               _rewrite_aws_query().
+    """
+    q_lower = query.lower()
+    for provider, base in CATALOG_PRESETS.items():
+        alias = base.get("default_alias") or provider
+        safe_alias = alias.replace("-", "_").replace(" ", "_").lower()
+        if safe_alias in polaris_catalogs:
+            continue  # already attached
+        if (safe_alias + ".") not in q_lower:
+            continue  # not referenced by this query
+        if not base.get("client_id") or not base.get("client_secret"):
+            continue  # no usable creds — let the query fail with its normal error
+        print(f"  Self-heal: re-attaching '{safe_alias}' ({provider}) — worker was respawned")
+        r = connect_polaris(safe_alias, base["endpoint"], base["catalog"],
+                            base["client_id"], base["client_secret"])
+        if r.get("status") != "ok":
+            print(f"  Self-heal: re-attach failed for '{safe_alias}': {r.get('message')}")
+            continue
+        if provider == "azure":
+            try:
+                run_azure_auth()
+            except Exception as _e:
+                print(f"  Self-heal: azure storage secret failed: {_e}")
+
+
 def run_sql(query, browse_prefix=""):
     """Execute a SQL query via DuckDB. Auto-loads tables from GCS if not found."""
     def _exec(q, timeout_sec=45):
@@ -992,6 +1034,14 @@ def run_sql(query, browse_prefix=""):
         # return its own error before the main process kills it
         result = duckdb_worker.send_command("exec_sql", {"query": q}, timeout=timeout_sec + 5)
         return result["cols"], result["data"]
+
+    # Self-heal: re-attach any referenced Polaris catalog the subprocess lost to a
+    # hung-query respawn, so queries don't fail with 'Catalog "..." does not exist'
+    # while the frontend still shows "Connected".
+    try:
+        _ensure_polaris_attached(query)
+    except Exception as _e:
+        print(f"  _ensure_polaris_attached error: {_e}")
 
     # Rewrite AWS Polaris queries to use iceberg_scan() with vended S3 credentials
     query = _rewrite_aws_query(query)
