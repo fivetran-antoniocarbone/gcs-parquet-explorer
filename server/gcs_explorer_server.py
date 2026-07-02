@@ -4449,11 +4449,37 @@ function api(endpoint, params) {
   });
 }
 
+// ===== SESSION KEEPALIVE / EXPIRY DETECTION =====
+// The server slides the idle timeout on every authenticated request, so an
+// actively-used tab stays logged in ("token renews"). This heartbeat routes
+// through api(), so an already-expired session is proactively bounced to the
+// clean /auth/timeout page ("logged off for inactivity") instead of letting
+// the page sit stale or throw weird errors on the next click.
+var _lastActivity = Date.now();
+var _heartbeatStarted = false;
+['mousemove', 'keydown', 'mousedown', 'scroll', 'touchstart'].forEach(function(ev) {
+  window.addEventListener(ev, function() { _lastActivity = Date.now(); }, { passive: true });
+});
+function _sessionCheck() { api('/api/whoami').catch(function() {}); }  // api() redirects on expiry
+function startSessionHeartbeat() {
+  if (_heartbeatStarted) return;
+  _heartbeatStarted = true;
+  // Returning to the tab immediately re-validates: an expired session lands on
+  // /auth/timeout at once rather than showing stale data.
+  document.addEventListener('visibilitychange', function() { if (!document.hidden) _sessionCheck(); });
+  // Periodic keepalive while the tab is used -> renews the sliding session.
+  setInterval(function() {
+    if (document.hidden) return;                              // background tabs are throttled anyway
+    if (Date.now() - _lastActivity < 30 * 60 * 1000) _sessionCheck();  // active in last 30 min -> renew
+  }, 5 * 60 * 1000);                                          // every 5 minutes
+}
+
 var currentBucket = '';
 var currentProvider = 'gcs';  // 'gcs' | 'azure_fs' | 'aws_s3'
 
 // ===== INIT =====
 function init() {
+  startSessionHeartbeat();  // keepalive + proactive expiry -> clean timeout page
   // Show logged-in user
   api('/api/whoami').then(function(who) {
     if (who.status === 'ok') {
