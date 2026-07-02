@@ -2324,22 +2324,36 @@ def reset_polaris_credentials(data):
 _LIST_CACHE = {}
 _LIST_CACHE_TTL = 300      # seconds a cached listing stays fresh
 _LIST_CACHE_MAX = 256      # cap distinct (bucket, prefix) entries kept in memory
-_DIR_STATS_MAX_PREFIXES = 300  # above this many subdirs, skip the deep stat scan
+_DIR_STATS_MAX_PREFIXES = 300  # above this many immediate subdirs, skip stats
+_DIR_STATS_SCAN_CAP = 10000    # abort the deep stat scan past this many blobs
 
 
-def _get_dir_stats(bucket, prefixes, parent_prefix):
-    """Get file count and total size under each directory's data/ subfolder."""
+def _get_dir_stats(bucket, prefixes, parent_prefix, scan_cap=_DIR_STATS_SCAN_CAP):
+    """Aggregate parquet file count/size per immediate subdirectory.
+
+    This is a DEEP (non-delimited) listing, so its cost scales with the TOTAL
+    number of objects under parent_prefix — not the number of immediate
+    subfolders. A dir with only a couple of subfolders can still sit atop a
+    million+ objects (e.g. totalfix/SUMDMO_oracle/). We therefore bound the
+    scan: if more than `scan_cap` blobs are seen we abort and report
+    truncated=True, and the caller omits stats rather than block for ~25s.
+
+    Returns (stats_dict, truncated)."""
     stats = {}
     if not prefixes:
-        return stats
-    # Do a deep listing of parent prefix and aggregate by directory
+        return stats, False
+    # Do a bounded deep listing of parent prefix and aggregate by directory
     try:
         gcs = _gcs()
     except NeedsGoogleAuth:
-        return stats
+        return stats, False
+    scanned = 0
     try:
         all_blobs = gcs.list_blobs(bucket, prefix=parent_prefix)
         for blob in all_blobs:
+            scanned += 1
+            if scanned > scan_cap:
+                return {}, True  # too big to stat cheaply — bail, let caller skip
             if not blob.name.endswith(".parquet") or "_delta_log" in blob.name:
                 continue
             # Find which directory this blob belongs to
@@ -2355,7 +2369,7 @@ def _get_dir_stats(bucket, prefixes, parent_prefix):
                     stats[key]["total_size"] += (blob.size or 0)
     except Exception:
         pass
-    return stats
+    return stats, False
 
 
 def list_path(prefix, bucket_name=None):
@@ -2391,8 +2405,13 @@ def list_path(prefix, bucket_name=None):
                           and prefix.startswith(BASE_PREFIX)
                           and prefix.count("/") >= 2)
         stats_skipped = is_dataset_dir and len(prefixes) > _DIR_STATS_MAX_PREFIXES
-        dir_stats = (_get_dir_stats(bucket, prefix_set, prefix)
-                     if (is_dataset_dir and not stats_skipped) else {})
+        dir_stats = {}
+        if is_dataset_dir and not stats_skipped:
+            dir_stats, truncated = _get_dir_stats(bucket, prefix_set, prefix)
+            if truncated:
+                # Subtree too large to stat within the blob cap — skip stats,
+                # still return the folders instantly.
+                dir_stats, stats_skipped = {}, True
 
         items = []
         for p in prefixes:
