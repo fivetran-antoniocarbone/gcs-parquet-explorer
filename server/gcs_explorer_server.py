@@ -2313,6 +2313,20 @@ def reset_polaris_credentials(data):
                         else "No personal overlay was set — shared baseline already in use.")}
 
 
+# ── Listing cache + lazy-stats guard ─────────────────────────────────────────
+# Big dataset dirs (totalfix/SUMDMO_*, tens of thousands of table folders) are
+# slow to browse for two reasons: (1) per-folder file-count/size stats need a
+# DEEP, non-delimited scan of every parquet blob under the parent — O(all blobs)
+# — and (2) re-opening the same folder repeats that scan. We cache the assembled
+# listing per (bucket, prefix) with a short TTL, and skip the deep stat scan once
+# a directory has more than _DIR_STATS_MAX_PREFIXES subfolders (folders still
+# open instantly; only the file-count/size columns are omitted for huge dirs).
+_LIST_CACHE = {}
+_LIST_CACHE_TTL = 300      # seconds a cached listing stays fresh
+_LIST_CACHE_MAX = 256      # cap distinct (bucket, prefix) entries kept in memory
+_DIR_STATS_MAX_PREFIXES = 300  # above this many subdirs, skip the deep stat scan
+
+
 def _get_dir_stats(bucket, prefixes, parent_prefix):
     """Get file count and total size under each directory's data/ subfolder."""
     stats = {}
@@ -2353,18 +2367,32 @@ def list_path(prefix, bucket_name=None):
         gcs = _gcs()
     except NeedsGoogleAuth:
         return _google_auth_response()
+
+    # Serve a fresh cached listing without touching GCS (fast re-browse).
+    ck = (current_bucket, prefix)
+    now = _time_mod.time()
+    hit = _LIST_CACHE.get(ck)
+    if hit and (now - hit[0]) < _LIST_CACHE_TTL:
+        _save_state(current_bucket, prefix)
+        return hit[1]
+
     try:
         bucket = gcs.bucket(current_bucket)
         iterator = gcs.list_blobs(bucket, prefix=prefix, delimiter="/")
         blobs = list(iterator)
         prefixes = sorted(iterator.prefixes)
 
-        # Gather stats only inside dataset directories under sap_cds_views/
+        # Gather stats only inside dataset directories under sap_cds_views/,
+        # and only when the folder count is small enough to stat cheaply.
+        # Huge dirs (SUMDMO_* with 50k+ table folders) skip the deep scan so
+        # they open instantly — file-count/size columns are simply omitted.
         prefix_set = set(prefixes)
         is_dataset_dir = (current_bucket == BUCKET_NAME
                           and prefix.startswith(BASE_PREFIX)
                           and prefix.count("/") >= 2)
-        dir_stats = _get_dir_stats(bucket, prefix_set, prefix) if is_dataset_dir else {}
+        stats_skipped = is_dataset_dir and len(prefixes) > _DIR_STATS_MAX_PREFIXES
+        dir_stats = (_get_dir_stats(bucket, prefix_set, prefix)
+                     if (is_dataset_dir and not stats_skipped) else {})
 
         items = []
         for p in prefixes:
@@ -2395,7 +2423,14 @@ def list_path(prefix, bucket_name=None):
         # Persist navigation state
         _save_state(current_bucket, prefix)
 
-        return {"status": "ok", "items": items, "prefix": prefix, "bucket": current_bucket}
+        result = {"status": "ok", "items": items, "prefix": prefix,
+                  "bucket": current_bucket, "stats_skipped": stats_skipped,
+                  "total_items": len(items)}
+        # Cache the assembled listing (bounded; simple clear on overflow).
+        if len(_LIST_CACHE) >= _LIST_CACHE_MAX:
+            _LIST_CACHE.clear()
+        _LIST_CACHE[ck] = (now, result)
+        return result
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -4357,6 +4392,8 @@ var polarisTables = [];
 var lastBrowseItems = [];
 var lastBrowsePrefix = '';
 var lastHasDataDir = false;
+var lastStatsSkipped = false;
+var MAX_RENDER = 500;  /* virtualization cap — huge dirs (50k+ folders) render a window; filter narrows it */
 var sortField = 'name';
 var sortAsc = true;
 var _sqlInFlight = false;
@@ -4478,6 +4515,7 @@ function browse(prefix, bucket) {
 
     lastBrowseItems = r.items;
     lastBrowsePrefix = prefix;
+    lastStatsSkipped = !!r.stats_skipped;
     lastHasDataDir = false;
     for (var i = 0; i < r.items.length; i++) { if (r.items[i].name === 'data/') { lastHasDataDir = true; break; } }
     browsedTables = [];
@@ -4541,15 +4579,28 @@ function renderFileList() {
     html += '<div class="file-item" style="background:#fffbeb;border-left:3px solid #f59e0b"><span class="file-icon">&#9889;</span><span class="file-name" style="color:#b45309;font-weight:600">Load all parquet data</span><button class="btn btn-orange btn-sm" onclick="event.stopPropagation();loadDir(\'' + prefix + '\')" style="margin-left:auto">Load</button></div>';
   }
 
-  for (var d = 0; d < dirs.length; d++) {
-    var dir = dirs[d];
+  /* Live filter over the data (not the DOM) so search stays instant even with
+     50k+ folders, and cap the rendered window (virtualization) so the browser
+     never has to paint tens of thousands of nodes at once. */
+  var qEl = document.getElementById('sidebarSearch');
+  var q = qEl ? qEl.value.trim().toLowerCase() : '';
+  var matchedDirs = q ? dirs.filter(function(x){ return x.name.toLowerCase().indexOf(q) >= 0; }) : dirs;
+  var matchedFiles = q ? files.filter(function(x){ return x.name.toLowerCase().indexOf(q) >= 0; }) : files;
+  var totalMatched = matchedDirs.length + matchedFiles.length;
+  var shown = 0, capped = false;
+
+  for (var d = 0; d < matchedDirs.length; d++) {
+    if (shown >= MAX_RENDER) { capped = true; break; }
+    var dir = matchedDirs[d];
     var meta = '';
     if (dir.file_count) meta += dir.file_count + ' file' + (dir.file_count > 1 ? 's' : '') + '  ';
     if (dir.size) meta += formatSize(dir.size);
     html += '<div class="file-item" onclick="browse(\'' + dir.path + '\')"><span class="file-icon">&#128193;</span><span class="file-name" style="color:#0073FF">' + escHtml(dir.name) + '</span><span class="file-meta">' + meta + '</span></div>';
+    shown++;
   }
-  for (var f = 0; f < files.length; f++) {
-    var file = files[f];
+  for (var f = 0; f < matchedFiles.length; f++) {
+    if (shown >= MAX_RENDER) { capped = true; break; }
+    var file = matchedFiles[f];
     var isPq = file.name.indexOf('.parquet') >= 0;
     var isJson = file.name.indexOf('.json') >= 0;
     var icon = isPq ? '&#128202;' : isJson ? '&#128196;' : '&#128206;';
@@ -4559,8 +4610,19 @@ function renderFileList() {
     var dateHtml = dateRel ? ('<span class="file-date" title="' + dateAbs + '">' + dateRel + '</span>') : '';
     var action = isPq ? "loadParquet('" + file.path + "')" : "loadText('" + file.path + "')";
     html += '<div class="file-item" onclick="' + action + '"><span class="file-icon">' + icon + '</span><span class="file-name">' + escHtml(file.name) + '</span>' + dateHtml + '<span class="file-meta">' + size + '</span></div>';
+    shown++;
   }
-  if (!items.length) html = '<div style="padding:30px;text-align:center;color:#6b7280">Empty directory</div>';
+
+  if (!items.length) {
+    html = '<div style="padding:30px;text-align:center;color:#6b7280">Empty directory</div>';
+  } else if (!totalMatched && q) {
+    html += '<div style="padding:20px;text-align:center;color:#6b7280">No matches for &ldquo;' + escHtml(q) + '&rdquo;</div>';
+  } else if (capped) {
+    html += '<div style="padding:12px 16px;text-align:center;color:#9ca3af;font-size:12px;background:#f8f9fa;border-top:1px solid #eee">Showing first ' + MAX_RENDER + ' of ' + totalMatched + '. Type in the filter box to narrow.</div>';
+  }
+  if (lastStatsSkipped) {
+    html += '<div style="padding:8px 16px;text-align:center;color:#b45309;font-size:11px;background:#fffbeb">Large directory — file counts/sizes hidden for speed.</div>';
+  }
   document.getElementById('fileList').innerHTML = html;
 }
 
@@ -4878,16 +4940,9 @@ function formatSize(bytes) {
 }
 
 function filterSidebar(query) {
-  var q = query.toLowerCase();
-  var items = document.querySelectorAll('#fileList .file-item');
-  for (var i = 0; i < items.length; i++) {
-    var el = items[i];
-    var name = el.querySelector('.file-name');
-    if (!name) continue;
-    var text = name.textContent.toLowerCase();
-    if (text === '..' || text === '.. (all buckets)') { el.style.display = ''; continue; }
-    el.style.display = (!q || text.indexOf(q) >= 0) ? '' : 'none';
-  }
+  /* Data-driven filter: re-render the windowed list from lastBrowseItems so
+     search stays instant even with 50k+ folders (no per-node DOM walk). */
+  renderFileList();
 }
 
 function escHtml(s) { if (s === null || s === undefined) return ''; s = String(s); return s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') : ''; }
